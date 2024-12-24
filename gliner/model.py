@@ -1,4 +1,5 @@
 import json
+import gc
 import os
 import re
 import warnings
@@ -247,7 +248,7 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
             multi_label=multi_label,
         )[0]
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def batch_predict_entities(
         self, texts, labels, flat_ner=True, threshold=0.5, multi_label=False
     ):
@@ -270,7 +271,7 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
         model_output = self.model(**model_input)[0]
 
         if not isinstance(model_output, torch.Tensor):
-            model_output = torch.from_numpy(model_output)
+            model_output = torch.from_numpy(model_output).to(self.device)
 
         outputs = self.decoder.decode(
             raw_batch["tokens"],
@@ -281,26 +282,31 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
             multi_label=multi_label,
         )
 
-        all_entities = []
+        # Pre-allocate results list
+        all_entities = [[] for _ in range(len(texts))]
+
         for i, output in enumerate(outputs):
-            start_token_idx_to_text_idx = raw_batch["all_start_token_idx_to_text_idx"][
-                i
+            start_indices = raw_batch["all_start_token_idx_to_text_idx"][i]
+            end_indices = raw_batch["all_end_token_idx_to_text_idx"][i]
+
+            # Batch process entities
+            entities = [
+                {
+                    "start": start_indices[start_idx],
+                    "end": end_indices[end_idx],
+                    "text": texts[i][start_indices[start_idx]:end_indices[end_idx]],
+                    "label": ent_type,
+                    "score": float(ent_score)
+                }
+                for start_idx, end_idx, ent_type, ent_score in output
             ]
-            end_token_idx_to_text_idx = raw_batch["all_end_token_idx_to_text_idx"][i]
-            entities = []
-            for start_token_idx, end_token_idx, ent_type, ent_score in output:
-                start_text_idx = start_token_idx_to_text_idx[start_token_idx]
-                end_text_idx = end_token_idx_to_text_idx[end_token_idx]
-                entities.append(
-                    {
-                        "start": start_token_idx_to_text_idx[start_token_idx],
-                        "end": end_token_idx_to_text_idx[end_token_idx],
-                        "text": texts[i][start_text_idx:end_text_idx],
-                        "label": ent_type,
-                        "score": ent_score,
-                    }
-                )
-            all_entities.append(entities)
+            all_entities[i] = entities
+
+        # Garbage collection
+        del model_output, start_indices, end_indices
+        torch.cuda.empty_cache()
+        torch.mps.empty_cache()
+        gc.collect()
 
         return all_entities
 
